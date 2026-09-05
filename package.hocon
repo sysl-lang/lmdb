@@ -1,0 +1,14 @@
+package {
+  name    = "lmdb"
+  version = "0.1.0"
+  sysl    = "0.0.91"
+}
+
+requires {
+  heap  = true
+  posix = true
+
+  pkg_config {
+    lmdb = "LMDB — `brew install lmdb` on macOS, Debian's liblmdb-dev, and pkg-config finds it either way"
+  }
+}

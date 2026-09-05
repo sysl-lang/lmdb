@@ -1,0 +1,230 @@
+module sh.sysl.lmdb.c
+@link("lmdb")
+@include("<stddef.h>")
+@include("<lmdb.h>")
+
+// LMDB as C declares it, and nothing else.
+//
+// This is the whole of the boundary: the library the program links, the header the numbers are
+// measured from, the three handles whose shape LMDB never publishes, the two structs it does, its
+// result codes, its flags, and one `extern` per function. `sh.sysl.lmdb` is where those turn into
+// something worth calling.
+//
+// ==There is no shim, and LMDB is an unusually clean case for that==
+//
+// `15 §7` names three shapes only C can reach — a caller-allocated opaque type, a macro, and a
+// shape with no sysl spelling. LMDB has none of them:
+//
+// - **Every handle is allocated by the library.** `mdb_env_create` and `mdb_txn_begin` hand back a
+//   pointer through an out-parameter, so nothing is placed in storage this side owns and there is
+//   no size to know.
+// - **Every flag and error code is a `#define`, which is what a `c const` block reads.** They are
+//   asked for by name below rather than transcribed, so a value that moved upstream fails a build
+//   rather than corrupting a call.
+// - **`MDB_val` is two words** — a length and a pointer — and it crosses by address in every
+//   function that takes one. sysl lays out an identical struct, and `tests.sysl` asserts its size
+//   and both offsets against the C rather than trusting that.
+//
+// **The `MDB_dbi` is the one thing that looks like a handle and is not.** It is an `unsigned int`
+// index into the environment's table, so it is a value rather than a pointer, and it must not be
+// wrapped in anything with a destructor. `mdb_dbi_close` exists and the layer above deliberately
+// never calls it — LMDB's own documentation says the handle is meant to live for the process, and
+// closing one while another thread holds a transaction is undefined.
+
+// The environment, a transaction, and a cursor. All three are C's incomplete types — declared in
+// the header and never defined — so a size was never on offer. Written bodyless here, which says
+// exactly that: only `*Env`, `*Txn` and `*Cursor` may be spoken, and none can be crossed with
+// another.
+opaque struct Env
+opaque struct Txn
+opaque struct Cursor
+
+// A key or a value, as LMDB passes them: a length and a pointer, in that order.
+//
+// **The order is the trap worth naming.** `mv_size` comes first and `mv_data` second, which is the
+// opposite of how nearly every other C library writes a counted buffer and the opposite of what a
+// reader who has just written five other bindings will type. Getting it backwards compiles, links,
+// and reads a length as a pointer. `tests.sysl` asserts both offsets.
+struct Val
+    size: usize
+    data: *u8
+end Val
+
+// What `mdb_stat` reports about one database.
+struct Stat
+    psize: uint
+    depth: uint
+    branch_pages: usize
+    leaf_pages: usize
+    overflow_pages: usize
+    entries: usize
+end Stat
+
+// What `mdb_env_info` reports about a whole environment.
+struct EnvInfo
+    mapaddr: *u8
+    mapsize: usize
+    last_pgno: usize
+    last_txnid: usize
+    maxreaders: uint
+    numreaders: uint
+end EnvInfo
+
+// ## The numbers, asked for rather than written down
+
+// The sizes and offsets the layer above depends on, so that a header change fails a test rather
+// than reading the wrong four bytes forever. `nghttp2`'s eleven frame arms are the precedent.
+c const
+    VAL_SIZE: usize      = "sizeof(MDB_val)"
+    VAL_OFF_SIZE: usize  = "offsetof(MDB_val, mv_size)"
+    VAL_OFF_DATA: usize  = "offsetof(MDB_val, mv_data)"
+    STAT_SIZE: usize     = "sizeof(MDB_stat)"
+    STAT_OFF_ENTRIES: usize = "offsetof(MDB_stat, ms_entries)"
+    INFO_SIZE: usize     = "sizeof(MDB_envinfo)"
+    INFO_OFF_READERS: usize = "offsetof(MDB_envinfo, me_numreaders)"
+
+// LMDB's own result codes. **They are far below zero on purpose** — the range starting at -30799 is
+// chosen not to collide with an `errno`, because LMDB returns those straight through when a system
+// call is what failed. That is why `Error` above this has a `System` arm: the set is open.
+c const
+    SUCCESS: int          = "MDB_SUCCESS"
+    KEYEXIST: int         = "MDB_KEYEXIST"
+    NOTFOUND: int         = "MDB_NOTFOUND"
+    PAGE_NOTFOUND: int    = "MDB_PAGE_NOTFOUND"
+    CORRUPTED: int        = "MDB_CORRUPTED"
+    PANIC: int            = "MDB_PANIC"
+    VERSION_MISMATCH: int = "MDB_VERSION_MISMATCH"
+    INVALID: int          = "MDB_INVALID"
+    MAP_FULL: int         = "MDB_MAP_FULL"
+    DBS_FULL: int         = "MDB_DBS_FULL"
+    READERS_FULL: int     = "MDB_READERS_FULL"
+    TLS_FULL: int         = "MDB_TLS_FULL"
+    TXN_FULL: int         = "MDB_TXN_FULL"
+    CURSOR_FULL: int      = "MDB_CURSOR_FULL"
+    PAGE_FULL: int        = "MDB_PAGE_FULL"
+    MAP_RESIZED: int      = "MDB_MAP_RESIZED"
+    INCOMPATIBLE: int     = "MDB_INCOMPATIBLE"
+    BAD_RSLOT: int        = "MDB_BAD_RSLOT"
+    BAD_TXN: int          = "MDB_BAD_TXN"
+    BAD_VALSIZE: int      = "MDB_BAD_VALSIZE"
+    BAD_DBI: int          = "MDB_BAD_DBI"
+    PROBLEM: int          = "MDB_PROBLEM"
+
+// The flags `env_open` takes.
+c const
+    FIXEDMAP: uint     = "MDB_FIXEDMAP"
+    NOSUBDIR: uint     = "MDB_NOSUBDIR"
+    NOSYNC: uint       = "MDB_NOSYNC"
+    RDONLY: uint       = "MDB_RDONLY"
+    NOMETASYNC: uint   = "MDB_NOMETASYNC"
+    WRITEMAP: uint     = "MDB_WRITEMAP"
+    MAPASYNC: uint     = "MDB_MAPASYNC"
+    NOTLS: uint        = "MDB_NOTLS"
+    NOLOCK: uint       = "MDB_NOLOCK"
+    NORDAHEAD: uint    = "MDB_NORDAHEAD"
+    NOMEMINIT: uint    = "MDB_NOMEMINIT"
+
+// The flags `dbi_open` takes. `RDONLY` above is shared with a transaction and is not repeated.
+c const
+    REVERSEKEY: uint = "MDB_REVERSEKEY"
+    DUPSORT: uint    = "MDB_DUPSORT"
+    INTEGERKEY: uint = "MDB_INTEGERKEY"
+    DUPFIXED: uint   = "MDB_DUPFIXED"
+    INTEGERDUP: uint = "MDB_INTEGERDUP"
+    REVERSEDUP: uint = "MDB_REVERSEDUP"
+    CREATE: uint     = "MDB_CREATE"
+
+// The flags `put` takes.
+c const
+    NOOVERWRITE: uint = "MDB_NOOVERWRITE"
+    NODUPDATA: uint   = "MDB_NODUPDATA"
+    CURRENT: uint     = "MDB_CURRENT"
+    RESERVE: uint     = "MDB_RESERVE"
+    APPEND: uint      = "MDB_APPEND"
+    APPENDDUP: uint   = "MDB_APPENDDUP"
+
+// Where a cursor is to move. These are `MDB_cursor_op`'s enumerators — an `enum` rather than a run
+// of `#define`s, which a `c const` block reads just as well.
+c const
+    FIRST: int          = "MDB_FIRST"
+    FIRST_DUP: int      = "MDB_FIRST_DUP"
+    GET_BOTH: int       = "MDB_GET_BOTH"
+    GET_BOTH_RANGE: int = "MDB_GET_BOTH_RANGE"
+    GET_CURRENT: int    = "MDB_GET_CURRENT"
+    LAST: int           = "MDB_LAST"
+    LAST_DUP: int       = "MDB_LAST_DUP"
+    NEXT: int           = "MDB_NEXT"
+    NEXT_DUP: int       = "MDB_NEXT_DUP"
+    NEXT_NODUP: int     = "MDB_NEXT_NODUP"
+    PREV: int           = "MDB_PREV"
+    PREV_DUP: int       = "MDB_PREV_DUP"
+    PREV_NODUP: int     = "MDB_PREV_NODUP"
+    SET: int            = "MDB_SET"
+    SET_KEY: int        = "MDB_SET_KEY"
+    SET_RANGE: int      = "MDB_SET_RANGE"
+
+// ## The environment
+
+extern "mdb_env_create" env_create(env: **Env) -> int
+extern "mdb_env_open" env_open(env: *Env, path: *u8, flags: uint, mode: uint) -> int
+extern "mdb_env_close" env_close(env: *Env) -> unit
+extern "mdb_env_set_mapsize" env_set_mapsize(env: *Env, size: usize) -> int
+extern "mdb_env_set_maxdbs" env_set_maxdbs(env: *Env, dbs: uint) -> int
+extern "mdb_env_set_maxreaders" env_set_maxreaders(env: *Env, readers: uint) -> int
+extern "mdb_env_get_maxreaders" env_get_maxreaders(env: *Env, readers: *uint) -> int
+extern "mdb_env_get_maxkeysize" env_get_maxkeysize(env: *Env) -> int
+extern "mdb_env_sync" env_sync(env: *Env, force: int) -> int
+extern "mdb_env_stat" env_stat(env: *Env, stat: *Stat) -> int
+extern "mdb_env_info" env_info(env: *Env, info: *EnvInfo) -> int
+extern "mdb_env_copy" env_copy(env: *Env, path: *u8) -> int
+extern "mdb_reader_check" reader_check(env: *Env, dead: *int) -> int
+
+// ## Transactions
+//
+// `parent` is null for a top-level transaction. A read-only one is begun with `RDONLY` in `flags`.
+
+extern "mdb_txn_begin" txn_begin(env: *Env, parent: *Txn, flags: uint, txn: **Txn) -> int
+extern "mdb_txn_commit" txn_commit(txn: *Txn) -> int
+extern "mdb_txn_abort" txn_abort(txn: *Txn) -> unit
+extern "mdb_txn_reset" txn_reset(txn: *Txn) -> unit
+extern "mdb_txn_renew" txn_renew(txn: *Txn) -> int
+extern "mdb_txn_id" txn_id(txn: *Txn) -> usize
+
+// ## Databases
+//
+// `name` is null for the environment's unnamed database, which is the one available when
+// `env_set_maxdbs` was never called.
+
+extern "mdb_dbi_open" dbi_open(txn: *Txn, name: *u8, flags: uint, dbi: *uint) -> int
+extern "mdb_dbi_flags" dbi_flags(txn: *Txn, dbi: uint, flags: *uint) -> int
+extern "mdb_stat" stat(txn: *Txn, dbi: uint, stat: *Stat) -> int
+extern "mdb_drop" drop_db(txn: *Txn, dbi: uint, del: int) -> int
+
+// ## Reading and writing
+//
+// **What `get` writes into `data` points into the memory map**, not into storage the caller owns.
+// It is valid until the transaction ends and must not be written through. The layer above says so
+// in the one place a caller will read it.
+
+extern "mdb_get" get(txn: *Txn, dbi: uint, key: *Val, data: *Val) -> int
+extern "mdb_put" put(txn: *Txn, dbi: uint, key: *Val, data: *Val, flags: uint) -> int
+extern "mdb_del" del(txn: *Txn, dbi: uint, key: *Val, data: *Val) -> int
+
+// ## Cursors
+
+extern "mdb_cursor_open" cursor_open(txn: *Txn, dbi: uint, cursor: **Cursor) -> int
+extern "mdb_cursor_close" cursor_close(cursor: *Cursor) -> unit
+extern "mdb_cursor_get" cursor_get(cursor: *Cursor, key: *Val, data: *Val, op: int) -> int
+extern "mdb_cursor_put" cursor_put(cursor: *Cursor, key: *Val, data: *Val, flags: uint) -> int
+extern "mdb_cursor_del" cursor_del(cursor: *Cursor, flags: uint) -> int
+extern "mdb_cursor_count" cursor_count(cursor: *Cursor, count: *usize) -> int
+
+// ## Saying what happened
+
+// The sentence LMDB has for a code, as a C string. It answers for its own codes and defers to
+// `strerror` for an `errno`, which is why the layer above asks it rather than keeping a table.
+extern "mdb_strerror" strerror(code: int) -> *u8
+
+// The library's version, as three numbers through out-parameters. The string it returns is ignored
+// here — the numbers are what a check would compare.
+extern "mdb_version" version(major: *int, minor: *int, patch: *int) -> *u8

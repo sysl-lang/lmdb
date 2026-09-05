@@ -1,0 +1,790 @@
+module sh.sysl.lmdb
+
+import sh.sysl.lmdb.c
+import sysl.buf.{Buf, buf}
+import sysl.slices.as_ptr
+import sysl.text.{cstring, from_cstring}
+
+// LMDB — the Lightning Memory-Mapped Database, bound to the library the machine has.
+//
+// LMDB is an ordered key-value store in a single memory-mapped file: a B+tree with copy-on-write
+// pages and multi-version concurrency control. Readers never block writers and writers never block
+// readers, there is exactly one writer at a time, and a read is a pointer into the map rather than a
+// copy. It is what OpenLDAP, Monero and a good deal of else keep their data in.
+//
+// ==A read hands you a pointer into the file, and that is the one thing to understand==
+//
+// `get` does not copy. What comes back is a `[]const u8` **pointing into the memory map**, and it is
+// valid only until the transaction that produced it ends:
+//
+//     val txn = env.read()?
+//     val db = txn.db()?
+//     val v = txn.get(db, b"key")?      // points into the map
+//     print(from_utf8(v)?)              // fine, we are still inside the transaction
+//     txn.commit()?
+//     print(from_utf8(v)?)              // NOT fine -- the pages may have been reused
+//
+// **Nothing in sysl enforces that**, because the lifetime is a property of LMDB's transaction rather
+// than of any sysl value, and a binding that copied every read to be safe would give up the single
+// biggest reason to use LMDB. So it is a rule a caller keeps: **anything wanted past the transaction
+// is copied out inside it.**
+//
+// The same is true of a cursor's `Entry`, and of everything `stat` and `info` do *not* have this
+// problem with — those are plain numbers copied across.
+//
+// ==Transactions==
+//
+// A transaction is begun from the environment, and it ends exactly once: `commit` or `abort`.
+// **Neither is required** — a transaction that is simply dropped aborts, which is the safe way
+// round, so a `?` returning early out of the middle of a write leaves the database untouched rather
+// than half-written.
+//
+//     val txn = env.write()?
+//
+//     txn.put(db, b"a", b"1")?
+//     txn.put(db, b"b", b"2")?          // a `?` here aborts everything above
+//
+//     txn.commit()?
+//
+// **There is one writer at a time, across the whole environment and across processes.**
+// `env.write()` blocks until the current writer finishes. A read transaction takes no lock at all
+// and sees the database exactly as it was when it began, however long it is held — which is the
+// other half of MVCC, and the reason a long-lived read transaction is the classic way to make an
+// LMDB file grow without bound: the pages it can still see cannot be reused.
+//
+// ==What is not bound yet==
+//
+// **Custom comparators.** `mdb_set_compare` and `mdb_set_dupsort` take a callback, which is
+// ordinary here — the callback's parameters are all pointers, so `&f` would work with no `@export`
+// — but a comparator that disagrees between two openings of the same database corrupts it silently,
+// and that is a sharp enough edge to want a design rather than a wrapper. LMDB's default ordering
+// is bytewise, and `INTEGERKEY` covers the common alternative.
+//
+// **`MDB_RESERVE` and `MDB_MULTIPLE`.** Both hand back storage to write into rather than taking
+// storage to read, which is a different shape from every call here and wants its own thinking.
+//
+// **Nested transactions.** `mdb_txn_begin` takes a parent and this binding always passes null.
+
+// Why an operation did not happen.
+//
+// **The set is open, which is why there is a `System` arm.** LMDB's own codes start at -30799,
+// chosen deliberately not to collide with an `errno` — because when a system call is what failed,
+// LMDB returns that `errno` straight through. So a code this enum does not name is not a bug in the
+// binding; it is the operating system talking.
+enum Error
+    // No such key. **This is the one that is usually not an error** — `get` answers it for a key
+    // that simply is not there, and most callers want `Option` rather than a `Result` arm, which is
+    // what `find` is for.
+    NotFound
+
+    // The key is already present and `overwrite` was false.
+    KeyExists
+
+    // The map is full. The environment's `map_size` is a hard ceiling set when it was opened, not a
+    // hint — LMDB never grows it on its own. Reopen with a larger one.
+    MapFull
+
+    // Another process grew the map. Reopen the environment.
+    MapResized
+
+    // More named databases were opened than `max_dbs` allowed for.
+    DbsFull
+
+    // The reader table is full.
+    ReadersFull
+
+    // The transaction has too many dirty pages.
+    TxnFull
+
+    // Too many cursors are open.
+    CursorFull
+
+    // A page has no room. LMDB's own code calls this one internal.
+    PageFull
+
+    // A page went missing — the file is damaged.
+    PageNotFound
+
+    // The page has the wrong sort of data in it. The file is damaged.
+    Corrupted
+
+    // A fatal error was hit earlier and the environment must be closed.
+    Panic
+
+    // The library and the file disagree about the format's version.
+    VersionMismatch
+
+    // The file is not an LMDB file.
+    Invalid
+
+    // The operation and this database's flags do not go together — asking for duplicates from a
+    // database that was not opened `dup_sort`, most often.
+    Incompatible
+
+    // A read-only transaction is being used by the wrong thread.
+    BadRslot
+
+    // The transaction is unusable — it has already ended, or its parent has.
+    BadTxn
+
+    // The key is empty, or too long, or the value is the wrong size for `INTEGERKEY`.
+    BadValSize
+
+    // The database handle is closed, or was never opened.
+    BadDbi
+
+    // Something LMDB itself did not expect.
+    Problem
+
+    // Thread-local storage keys are exhausted.
+    TlsFull
+
+    // The operating system refused, and this is its `errno`. `ENOENT` for a path that is not there,
+    // `EACCES` for one that cannot be opened, `EAGAIN` for a lock — all arrive here.
+    System(errno: int)
+
+    // The number LMDB spells this as, which is what `message` asks it about.
+    code(self) -> int = self match
+        NotFound         -> c.NOTFOUND
+        KeyExists        -> c.KEYEXIST
+        MapFull          -> c.MAP_FULL
+        MapResized       -> c.MAP_RESIZED
+        DbsFull          -> c.DBS_FULL
+        ReadersFull      -> c.READERS_FULL
+        TxnFull          -> c.TXN_FULL
+        CursorFull       -> c.CURSOR_FULL
+        PageFull         -> c.PAGE_FULL
+        PageNotFound     -> c.PAGE_NOTFOUND
+        Corrupted        -> c.CORRUPTED
+        Panic            -> c.PANIC
+        VersionMismatch  -> c.VERSION_MISMATCH
+        Invalid          -> c.INVALID
+        Incompatible     -> c.INCOMPATIBLE
+        BadRslot         -> c.BAD_RSLOT
+        BadTxn           -> c.BAD_TXN
+        BadValSize       -> c.BAD_VALSIZE
+        BadDbi           -> c.BAD_DBI
+        Problem          -> c.PROBLEM
+        TlsFull          -> c.TLS_FULL
+        System(errno)    -> errno
+
+    // What LMDB says about it. **Asked rather than kept as a table here**, because `mdb_strerror`
+    // answers for its own codes and defers to `strerror` for an `errno` — so the `System` arm gets a
+    // real sentence for free, and one in the machine's own locale.
+    message(self) -> string =
+        from_cstring(c.strerror(self.code())).unwrap_or("LMDB reported an error it could not describe")
+end Error
+
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message(), out, fmt)
+
+// Which `Error` a return code is. Anything LMDB does not claim is the operating system's.
+//
+// **`private[lmdb]` rather than `private`**, because `private` in sysl is *file*-private and the
+// tests are a different file. The open-error-set claim is the one thing here worth testing without
+// arranging for a real `errno` to happen.
+private[lmdb] failure(code: int) -> Error = code match
+    c.NOTFOUND         -> NotFound
+    c.KEYEXIST         -> KeyExists
+    c.MAP_FULL         -> MapFull
+    c.MAP_RESIZED      -> MapResized
+    c.DBS_FULL         -> DbsFull
+    c.READERS_FULL     -> ReadersFull
+    c.TXN_FULL         -> TxnFull
+    c.CURSOR_FULL      -> CursorFull
+    c.PAGE_FULL        -> PageFull
+    c.PAGE_NOTFOUND    -> PageNotFound
+    c.CORRUPTED        -> Corrupted
+    c.PANIC            -> Panic
+    c.VERSION_MISMATCH -> VersionMismatch
+    c.INVALID          -> Invalid
+    c.INCOMPATIBLE     -> Incompatible
+    c.BAD_RSLOT        -> BadRslot
+    c.BAD_TXN          -> BadTxn
+    c.BAD_VALSIZE      -> BadValSize
+    c.BAD_DBI          -> BadDbi
+    c.PROBLEM          -> Problem
+    c.TLS_FULL         -> TlsFull
+    _                  -> System(code)
+
+// Turns a return code into a `Result`. Every call in this file goes through it.
+private checked(code: int) -> Result[unit, Error] =
+    if code == c.SUCCESS then Ok(()) else Err(failure(code))
+
+// A slice as LMDB wants to see it. **The length comes first**, which is `MDB_val`'s order and the
+// opposite of most C libraries; `c.sysl` says so at the struct and `tests.sysl` asserts it.
+private val_of(bytes: []const u8) -> c.Val = c.Val(bytes.len, as_ptr(bytes))
+
+// An empty one, for the out-parameters LMDB fills in.
+private empty_val() -> c.Val = c.Val(0, ptr_cast(0usize))
+
+// What LMDB handed back, as a slice **pointing into the memory map**. Valid until the transaction
+// ends, as the file header says at length.
+private slice_of(v: c.Val) -> []const u8 =
+    if v.size == 0 then [] else v.data[0..<v.size]
+
+// What `mdb_stat` reports about a database, or `mdb_env_stat` about an environment's main one.
+struct Stat
+    // The size of a database page, in bytes. The same for every database in an environment.
+    page_size: uint
+
+    // How tall the B+tree is.
+    depth: uint
+
+    // How many internal pages it has.
+    branch_pages: usize
+
+    // How many leaf pages.
+    leaf_pages: usize
+
+    // How many pages hold values too large for a leaf.
+    overflow_pages: usize
+
+    // How many key-value pairs are in it. This is the one most callers want.
+    entries: usize
+end Stat
+
+// What `mdb_env_info` reports about a whole environment.
+struct Info
+    // How large the map is, in bytes — the ceiling set when the environment was opened.
+    map_size: usize
+
+    // The last page written.
+    last_page: usize
+
+    // The identifier of the last committed transaction.
+    last_txn: usize
+
+    // How many reader slots there are.
+    max_readers: uint
+
+    // How many are in use.
+    readers: uint
+end Info
+
+// A database inside an environment, named or unnamed.
+//
+// **This is a value rather than a handle with a lifetime**, which is LMDB's design and not a
+// simplification: an `MDB_dbi` is an index into the environment's table, so it copies freely and
+// outlives the transaction that opened it. There is deliberately no destructor — `mdb_dbi_close` is
+// documented as unnecessary and unsafe to call while another thread is using the handle, and LMDB
+// intends a handle to live for as long as the process does.
+struct Db
+    private dbi: uint
+end Db
+// ==Why each of the three resources is TWO types==
+//
+// `EnvHandle` owns the C pointer and has the destructor; `Env` is a plain value holding a `&` to
+// one. The same for `TxnHandle`/`Txn` and `CursorHandle`/`Cursor`. It reads like ceremony and it is
+// forced, by something worth knowing before designing any binding whose handles nest:
+//
+// **A method cannot reach the box it is inside.** A `&Env` method receives `self` by value, so
+// there is no way for `read()` to put *the box it was called on* into the transaction it is
+// building. The obvious move — construct a fresh `Env` around the same pointer — compiles, links,
+// and hands out a **second owner** of one `MDB_env`: two boxes, two counts, two calls to
+// `mdb_env_close`. This binding was written that way first, and every test that opened a
+// transaction died with a `SIGTRAP` inside LMDB while the four that never opened one passed.
+//
+// Splitting the ownership out fixes it exactly. `Env` is copyable and cheap — copying it copies a
+// `&EnvHandle`, which is a count — so a method *can* pass `self.h` downward, and there is only ever
+// one owner of the C pointer no matter how many `Env` values exist.
+//
+// **The nesting is what the `&` fields buy.** A `TxnHandle` holds a `&EnvHandle` and a
+// `CursorHandle` holds a `&TxnHandle`, so the three closes are ordered by construction: an
+// environment cannot be closed while a transaction is open, and a transaction cannot end while a
+// cursor is live. Nothing has to remember to do it in the right order, and no comment has to ask.
+
+// The environment's C pointer, and the only thing that closes it.
+private struct EnvHandle
+    private e: *c.Env
+
+    private raw(self) -> *c.Env = self.e
+end EnvHandle
+
+impl Drop for EnvHandle
+    drop(self)
+        c.env_close(self.e)
+    end drop
+
+// An open LMDB environment: one directory, one map, and every database inside it.
+//
+// Copying one is free and copies no data — it is a reference to the same environment.
+struct Env
+    private h: &EnvHandle
+
+    // Begins a read-only transaction, which takes no lock and blocks nothing.
+    //
+    // It sees the database as it was at this moment and will keep seeing that however long it is
+    // held. **Holding one open for a long time is how an LMDB file grows without bound**, because
+    // the pages it can still see cannot be reused; a reader that is finished should end.
+    read(self) -> Result[Txn, Error] = self.begin(c.RDONLY)
+
+    // Begins a read-write transaction. **There is one writer at a time** across the whole
+    // environment and across every process using it, so this blocks until the current one finishes.
+    write(self) -> Result[Txn, Error] = self.begin(0)
+
+    private begin(self, flags: uint) -> Result[Txn, Error]
+        var t: *c.Txn = ptr_cast(0usize)
+
+        checked(c.txn_begin(self.h.raw(), ptr_cast(0usize), flags, &t))?
+
+        Ok(Txn(TxnHandle(t, self.h, false, buf())))
+
+    // Flushes the map to disk. Pointless unless the environment was opened `no_sync` or
+    // `write_map`, since a commit already does it otherwise.
+    //
+    // `force` asks for a real flush even where the environment's flags say it may be skipped.
+    sync(self, force: bool = true) -> Result[unit, Error] =
+        checked(c.env_sync(self.h.raw(), if force then 1 else 0))
+
+    // What the environment's main database looks like.
+    stat(self) -> Result[Stat, Error]
+        var s = c.Stat(0, 0, 0, 0, 0, 0)
+
+        checked(c.env_stat(self.h.raw(), &s))?
+
+        Ok(Stat(s.psize, s.depth, s.branch_pages, s.leaf_pages, s.overflow_pages, s.entries))
+
+    // How large the map is and how much of it has been used.
+    info(self) -> Result[Info, Error]
+        var i = c.EnvInfo(ptr_cast(0usize), 0, 0, 0, 0, 0)
+
+        checked(c.env_info(self.h.raw(), &i))?
+
+        Ok(Info(i.mapsize, i.last_pgno, i.last_txnid, i.maxreaders, i.numreaders))
+
+    // The longest key this build of LMDB will take, in bytes. A longer one is refused with
+    // `BadValSize` rather than truncated.
+    //
+    // **Ask rather than assume 511.** That was the figure for every LMDB 0.9 build and is quoted
+    // all over the internet; it is derived from the page size, and a 1.0 build on a machine with
+    // larger pages answers 8122. A binding that hard-coded the old number would refuse keys LMDB
+    // would have taken, and a test written around it walks off the end of its own buffer — which is
+    // how this comment came to be here.
+    max_key_size(self) -> int = c.env_get_maxkeysize(self.h.raw())
+
+    // Copies the whole environment to a directory, which is LMDB's hot backup: it runs against a
+    // live environment and produces a consistent snapshot without stopping anybody.
+    copy_to(self, path: string) -> Result[unit, Error]
+        val p = cstring(path)
+
+        checked(c.env_copy(self.h.raw(), p.ptr))
+
+    // Clears reader slots left behind by processes that died, and answers how many it cleared.
+    // Worth calling at startup where a crash may have left stale readers pinning old pages.
+    clear_stale_readers(self) -> Result[int, Error]
+        var dead = 0
+
+        checked(c.reader_check(self.h.raw(), &dead))?
+
+        Ok(dead)
+end Env
+
+// Opens an environment at `path`.
+//
+// **`map_size` is a hard ceiling, not a hint.** LMDB reserves that much address space and never
+// grows it on its own; a write past it fails with `MapFull`. It costs nothing until it is used —
+// the map is sparse — so it is normal to name a figure far larger than the data, and the default
+// here of 10 MiB is deliberately small enough to be wrong for anything real.
+//
+// **`max_dbs` is the number of *named* databases.** The unnamed one is always available and does
+// not count. Naming zero and then asking for a named database gives `DbsFull`.
+//
+//     val env = env("/var/db/things", map_size = 1 << 30, max_dbs = 4)?
+//
+// By default `path` is a **directory** that LMDB creates two files in, and it must already exist.
+// `no_subdir` makes it a single file instead, which is what a small embedded store usually wants.
+//
+// **`no_tls` is the one that will bite before it is understood.** By default LMDB gives each
+// *thread* a single slot in the reader table, so a second read transaction on a thread that already
+// has one open is refused with `BadRslot` — which reads as a corrupt lock file and is a design
+// decision. `no_tls = true` moves the slot onto the transaction instead, so a thread may hold as
+// many readers as it likes, and it is what a program with an event loop or a thread pool wants.
+// The cost is that a read transaction then belongs to whoever holds it rather than to a thread.
+env(path: string, map_size: usize = 10 * 1024 * 1024, max_dbs: uint = 0,
+    read_only: bool = false, no_subdir: bool = false, no_sync: bool = false,
+    write_map: bool = false, no_tls: bool = false, mode: uint = 0o644) -> Result[Env, Error]
+
+    var e: *c.Env = ptr_cast(0usize)
+
+    checked(c.env_create(&e))?
+
+    // **From here on a failure has to close the environment by hand**, because nothing owns it yet:
+    // the `EnvHandle` that would have a destructor is only built on the success path below.
+    val opened = open_into(e, path, map_size, max_dbs, read_only, no_subdir, no_sync, write_map, no_tls, mode)
+
+    opened match
+        Ok(_) -> Ok(Env(EnvHandle(e)))
+        Err(why) ->
+            c.env_close(e)
+            Err(why)
+
+private open_into(e: *c.Env, path: string, map_size: usize, max_dbs: uint,
+                  read_only: bool, no_subdir: bool, no_sync: bool, write_map: bool,
+                  no_tls: bool, mode: uint) -> Result[unit, Error]
+
+    checked(c.env_set_mapsize(e, map_size))?
+
+    if max_dbs > 0 then checked(c.env_set_maxdbs(e, max_dbs))?
+
+    var flags: uint = 0
+
+    if read_only then flags = flags | c.RDONLY
+    if no_subdir then flags = flags | c.NOSUBDIR
+    if no_sync then flags = flags | c.NOSYNC
+    if write_map then flags = flags | c.WRITEMAP
+    if no_tls then flags = flags | c.NOTLS
+
+    val p = cstring(path)
+
+    checked(c.env_open(e, p.ptr, flags, mode))
+
+// The transaction's C pointer, the environment it belongs to, whether it has ended, and every
+// cursor still open in it.
+//
+// ==Why the cursors are tracked, which cost two wrong answers before this one==
+//
+// LMDB frees the transaction structure itself when a transaction ends, and `mdb_cursor_close`
+// reads the transaction out of the cursor. So **a cursor closed after its transaction has ended is
+// a use-after-free**, whether the transaction was committed or aborted. That is a crash at program
+// exit, a long way from the `abort` that caused it, and this binding had it.
+//
+// The obvious repair — have the cursor's destructor skip the close once the transaction has ended
+// — trades the crash for a **leak**, and only in the read case, which is what makes it convincing
+// for a while. A write transaction's cursors really are freed by LMDB when it ends; a read
+// transaction's are not tracked by LMDB at all and are the caller's to close. Measured: 200,000
+// rounds of open-cursor-then-abort grew the resident set from 2.8 MB to 89 MB.
+//
+// So neither closing after nor skipping is right, and what is right is to close **before**: ending
+// a transaction closes every cursor still open in it, and a cursor destroyed first takes itself off
+// the list. A caller can then commit or abort with cursors live, or drop them in any order, and
+// both the crash and the leak are gone.
+private struct TxnHandle
+    private t: *c.Txn
+
+    // The environment, held strongly, so that it cannot be closed while this transaction is open.
+    private env: &EnvHandle
+
+    private ended: bool
+
+    // The address of every cursor open in this transaction. Addresses rather than handles, because
+    // a handle here would be a reference cycle — a `CursorHandle` already holds this one.
+    private live: Buf[usize]
+
+    private raw(self) -> *c.Txn = self.t
+    private is_ended(self) -> bool = self.ended
+
+    // Mutating through the box is what makes the split work: every `Txn` value copied from another
+    // points at *this* handle, so a `commit` through any of them is seen by all of them and by the
+    // destructor.
+    private track(*self, cur: *c.Cursor)
+        self.live.push(usize(cur))
+
+    private untrack(*self, cur: *c.Cursor)
+        val a = usize(cur)
+        var i: usize = 0
+
+        while i < self.live.len()
+            if self.live[i] == a then
+                self.live.remove(i)
+                return
+
+            i += 1
+
+    // Closes every cursor still open, then marks the transaction spent. Called by `commit`, by
+    // `abort`, and by the destructor — so there is no path that ends a transaction and leaves a
+    // cursor pointing at freed memory.
+    private end(*self)
+        var i: usize = 0
+
+        while i < self.live.len()
+            c.cursor_close(ptr_cast(self.live[i]))
+            i += 1
+
+        self.live.clear()
+
+        self.ended = true
+end TxnHandle
+
+// **A transaction that is merely dropped aborts.** That is the safe way round: an early return out
+// of the middle of a sequence of writes leaves the database as it was, and a caller who meant to
+// keep the work has already said so with `commit`.
+impl Drop for TxnHandle
+    drop(self)
+        if !self.ended then c.txn_abort(self.t)
+    end drop
+
+// A transaction. Everything read or written goes through one.
+//
+// It ends exactly once — `commit`, `abort`, or being dropped.
+struct Txn
+    private h: &TxnHandle
+
+    // Commits everything written in this transaction. After it, the transaction is spent and every
+    // slice read through it is dangling.
+    commit(self) -> Result[unit, Error]
+        if self.h.is_ended() then return Err(BadTxn)
+
+        // Closes every cursor still open first, which is what makes this safe to call with one
+        // live. `TxnHandle` says why at length.
+        self.h.end()
+
+        checked(c.txn_commit(self.h.raw()))
+
+    // Throws everything away. A dropped transaction does this by itself; calling it is how a caller
+    // says so on purpose.
+    abort(self)
+        if !self.h.is_ended() then
+            self.h.end()
+            c.txn_abort(self.h.raw())
+
+    // Opens a database in this transaction.
+    //
+    // `name` of `None` is the environment's unnamed database, which is always there. A named one
+    // needs `max_dbs` to have been large enough when the environment was opened, and — the first
+    // time — a **write** transaction, since creating it writes.
+    db(self, name: Option[string] = None, create: bool = true, dup_sort: bool = false,
+       reverse_key: bool = false, integer_key: bool = false) -> Result[Db, Error]
+
+        var flags: uint = 0
+
+        if create then flags = flags | c.CREATE
+        if dup_sort then flags = flags | c.DUPSORT
+        if reverse_key then flags = flags | c.REVERSEKEY
+        if integer_key then flags = flags | c.INTEGERKEY
+
+        var dbi: uint = 0
+
+        val code = name match
+            None -> c.dbi_open(self.h.raw(), ptr_cast(0usize), flags, &dbi)
+            Some(n) ->
+                val s = cstring(n)
+
+                c.dbi_open(self.h.raw(), s.ptr, flags, &dbi)
+
+        checked(code)?
+
+        Ok(Db(dbi))
+
+    // Reads a key. **What comes back points into the memory map** and is valid only until this
+    // transaction ends.
+    //
+    // A key that is not there is `Err(NotFound)`; `find` is the same call answering `None` instead,
+    // and is usually what a caller wants.
+    get(self, db: Db, key: []const u8) -> Result[[]const u8, Error]
+        var k = val_of(key)
+        var v = empty_val()
+
+        checked(c.get(self.h.raw(), db.dbi, &k, &v))?
+
+        Ok(slice_of(v))
+
+    // The same read, with a missing key as `None` rather than an error.
+    find(self, db: Db, key: []const u8) -> Result[Option[[]const u8], Error] =
+        self.get(db, key) match
+            Ok(v)          -> Ok(Some(v))
+            Err(NotFound)  -> Ok(None)
+            Err(why)       -> Err(why)
+
+    // Whether a key is present, without caring what is under it.
+    has(self, db: Db, key: []const u8) -> Result[bool, Error] =
+        self.find(db, key).map((found) -> found.is_some())
+
+    // Writes a key.
+    //
+    // `overwrite` false answers `KeyExists` rather than replacing a value that is already there.
+    // `append` promises the key is greater than every key already in the database, which lets LMDB
+    // skip a search and pack pages full — it answers `KeyExists` if the promise is broken, so it is
+    // safe to try.
+    //
+    // In a `dup_sort` database, a `put` adds a value to the key rather than replacing one.
+    put(self, db: Db, key: []const u8, value: []const u8,
+        overwrite: bool = true, append: bool = false) -> Result[unit, Error]
+
+        var flags: uint = 0
+
+        if !overwrite then flags = flags | c.NOOVERWRITE
+        if append then flags = flags | c.APPEND
+
+        var k = val_of(key)
+        var v = val_of(value)
+
+        checked(c.put(self.h.raw(), db.dbi, &k, &v, flags))
+
+    // Deletes a key and everything under it. `NotFound` if it was not there.
+    delete(self, db: Db, key: []const u8) -> Result[unit, Error]
+        var k = val_of(key)
+
+        checked(c.del(self.h.raw(), db.dbi, &k, ptr_cast(0usize)))
+
+    // Deletes one value of a key in a `dup_sort` database, leaving the others.
+    delete_value(self, db: Db, key: []const u8, value: []const u8) -> Result[unit, Error]
+        var k = val_of(key)
+        var v = val_of(value)
+
+        checked(c.del(self.h.raw(), db.dbi, &k, &v))
+
+    // Empties a database, keeping the handle.
+    clear(self, db: Db) -> Result[unit, Error] = checked(c.drop_db(self.h.raw(), db.dbi, 0))
+
+    // Empties a database and gives up its handle. After this the `Db` must not be used again.
+    destroy(self, db: Db) -> Result[unit, Error] = checked(c.drop_db(self.h.raw(), db.dbi, 1))
+
+    // What one database looks like.
+    stat(self, db: Db) -> Result[Stat, Error]
+        var s = c.Stat(0, 0, 0, 0, 0, 0)
+
+        checked(c.stat(self.h.raw(), db.dbi, &s))?
+
+        Ok(Stat(s.psize, s.depth, s.branch_pages, s.leaf_pages, s.overflow_pages, s.entries))
+
+    // Opens a cursor over a database. A cursor is how a range, an ordered walk, or the several
+    // values of one `dup_sort` key are reached.
+    cursor(self, db: Db) -> Result[Cursor, Error]
+        var cur: *c.Cursor = ptr_cast(0usize)
+
+        checked(c.cursor_open(self.h.raw(), db.dbi, &cur))?
+
+        self.h.track(cur)
+
+        Ok(Cursor(CursorHandle(cur, self.h)))
+
+    // This transaction's identifier — for a reader, the write transaction whose state it is seeing.
+    id(self) -> usize = c.txn_id(self.h.raw())
+end Txn
+
+// One key and one value, as a cursor found them. **Both point into the memory map** and live only
+// as long as the transaction.
+struct Entry
+    key: []const u8
+    value: []const u8
+end Entry
+
+// The cursor's C pointer and the transaction it belongs to.
+private struct CursorHandle
+    private cur: *c.Cursor
+
+    // The transaction, held strongly, so a cursor can never outlive it.
+    private txn: &TxnHandle
+
+    private raw(self) -> *c.Cursor = self.cur
+end CursorHandle
+
+// A cursor destroyed while its transaction is still open closes itself and comes off the
+// transaction's list, so that ending the transaction later does not close it a second time. One
+// destroyed afterwards does nothing at all — `TxnHandle.end` has already closed it, and closing it
+// again would read a transaction LMDB has freed.
+impl Drop for CursorHandle
+    drop(self)
+        if !self.txn.is_ended() then
+            self.txn.untrack(self.cur)
+            c.cursor_close(self.cur)
+    end drop
+
+// A position in a database, and the way to walk one in order.
+//
+//     val cur = txn.cursor(db)?
+//     var at = cur.first()?
+//
+//     loop
+//         at match
+//             None -> break
+//             Some(e) ->
+//                 print(from_utf8(e.key)?)
+//                 at = cur.next()?
+struct Cursor
+    private h: &CursorHandle
+
+    // The first entry in the database, or `None` if it is empty.
+    first(self) -> Result[Option[Entry], Error] = self.step(c.FIRST)
+
+    // The last entry.
+    last(self) -> Result[Option[Entry], Error] = self.step(c.LAST)
+
+    // The entry after this one, or `None` at the end. In a `dup_sort` database this walks every
+    // value of every key; `next_key` skips to the next distinct key.
+    next(self) -> Result[Option[Entry], Error] = self.step(c.NEXT)
+
+    // The entry before this one, or `None` at the beginning.
+    prev(self) -> Result[Option[Entry], Error] = self.step(c.PREV)
+
+    // The next distinct key, skipping the remaining values of this one.
+    next_key(self) -> Result[Option[Entry], Error] = self.step(c.NEXT_NODUP)
+
+    // The next value of the key the cursor is on, or `None` when they are exhausted.
+    next_value(self) -> Result[Option[Entry], Error] = self.step(c.NEXT_DUP)
+
+    // Where the cursor is now.
+    current(self) -> Result[Option[Entry], Error] = self.step(c.GET_CURRENT)
+
+    // Moves to exactly `key`, or answers `None` and does not move.
+    seek(self, key: []const u8) -> Result[Option[Entry], Error] = self.seek_op(key, c.SET_KEY)
+
+    // Moves to `key` or to the first key after it — which is how a range scan starts, and the
+    // reason a cursor is worth having over repeated `get`s.
+    //
+    //     var at = cur.seek_range("user:".view())?
+    //     loop
+    //         at match
+    //             Some(e) -> if !from_utf8(e.key)?.starts_with("user:") then break
+    //             None    -> break
+    seek_range(self, key: []const u8) -> Result[Option[Entry], Error] = self.seek_op(key, c.SET_RANGE)
+
+    // How many values the key the cursor is on has. Only meaningful in a `dup_sort` database.
+    //
+    // **A cursor whose transaction has ended is spent**, and every method here will be reading
+    // storage LMDB has reclaimed. Dropping it afterwards is safe — the destructor checks — but
+    // using it is not, and nothing can check that for you.
+    count(self) -> Result[usize, Error]
+        var n: usize = 0
+
+        checked(c.cursor_count(self.h.raw(), &n))?
+
+        Ok(n)
+
+    // Deletes the entry the cursor is on. The cursor stays where it was, so a `next` continues.
+    delete(self) -> Result[unit, Error] = checked(c.cursor_del(self.h.raw(), 0))
+
+    // Writes through the cursor, which is how `dup_sort` values are added in order.
+    put(self, key: []const u8, value: []const u8) -> Result[unit, Error]
+        var k = val_of(key)
+        var v = val_of(value)
+
+        checked(c.cursor_put(self.h.raw(), &k, &v, 0))
+
+    // Every move goes through here: `NotFound` is the end of the walk rather than a failure, which
+    // is the whole difference between a cursor and a `get`.
+    private step(self, op: int) -> Result[Option[Entry], Error]
+        var k = empty_val()
+        var v = empty_val()
+
+        val code = c.cursor_get(self.h.raw(), &k, &v, op)
+
+        if code == c.NOTFOUND then return Ok(None)
+
+        checked(code)?
+
+        Ok(Some(Entry(slice_of(k), slice_of(v))))
+
+    private seek_op(self, key: []const u8, op: int) -> Result[Option[Entry], Error]
+        var k = val_of(key)
+        var v = empty_val()
+
+        val code = c.cursor_get(self.h.raw(), &k, &v, op)
+
+        if code == c.NOTFOUND then return Ok(None)
+
+        checked(code)?
+
+        Ok(Some(Entry(slice_of(k), slice_of(v))))
+end Cursor
+
+// The version of LMDB this program is linked against, as major, minor and patch.
+version() -> (int, int, int)
+    var major = 0
+    var minor = 0
+    var patch = 0
+
+    c.version(&major, &minor, &patch)
+
+    (major, minor, patch)

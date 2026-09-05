@@ -1,0 +1,770 @@
+module sh.sysl.lmdb
+@tests
+
+import sh.sysl.lmdb.c
+import sysl.fs.{exists, make_temp_dir, remove_dir_all}
+import sysl.text.{Search, from_utf8}
+
+// The binding's own tests, run against a real LMDB.
+//
+// Each test makes its own temporary directory and removes it afterwards, so nothing here depends on
+// the order tests run in or on what a previous run left behind.
+
+// ## The boundary
+
+@test("the structs sysl lays out are the ones C has")
+layout()
+    assert_eq(sizeof(c.Val), c.VAL_SIZE, "MDB_val")
+    assert_eq(offsetof(c.Val, size), c.VAL_OFF_SIZE, "mv_size comes first, which is the trap")
+    assert_eq(offsetof(c.Val, data), c.VAL_OFF_DATA, "mv_data comes second")
+    assert_eq(sizeof(c.Stat), c.STAT_SIZE, "MDB_stat")
+    assert_eq(offsetof(c.Stat, entries), c.STAT_OFF_ENTRIES, "ms_entries")
+    assert_eq(sizeof(c.EnvInfo), c.INFO_SIZE, "MDB_envinfo")
+    assert_eq(offsetof(c.EnvInfo, numreaders), c.INFO_OFF_READERS, "me_numreaders")
+
+@test("the library links and says which version it is")
+version_reads()
+    val (major, minor, patch) = version()
+
+    assert(major >= 0, "a major version came back")
+    assert(major > 0 || minor >= 9,
+           f"LMDB ${major}%d.${minor}%d.${patch}%d is older than this binding was written against")
+
+// **The error set is open**, and this is the test that says so: LMDB's own codes are far below zero
+// so that an `errno` can pass straight through, and anything unclaimed becomes `System`.
+@test("an unclaimed code is the operating system talking, not a gap in the enum")
+open_error_set()
+    assert_eq(failure(c.NOTFOUND).code(), c.NOTFOUND, "one LMDB claims")
+    assert_eq(failure(2).code(), 2, "ENOENT is not LMDB's and passes through")
+
+    failure(2) match
+        System(errno) -> assert_eq(errno, 2, "carried as a system error")
+        other         -> assert(false, f"ENOENT should not be an LMDB code: ${other}%s")
+
+// `mdb_strerror` is asked rather than a table being kept here, and this is what that buys: the
+// `System` arm gets a real sentence too.
+@test("every error has a sentence, LMDB's own or the system's")
+messages()
+    assert(NotFound.message().len > 0, "LMDB describes its own")
+    assert(MapFull.message().len > 0, "and this one")
+    assert(System(2).message().len > 0, "and strerror describes ENOENT")
+    assert(NotFound.message() != System(2).message(), "they are different sentences")
+
+// ## Writing and reading
+
+@test("what is written and committed is there afterwards")
+round_trip()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    w.put(db, "alpha".view(), "one".view()).unwrap()
+    w.put(db, "beta".view(), "two".view()).unwrap()
+    w.commit().unwrap()
+
+    val r = e.read().unwrap()
+    val rdb = r.db().unwrap()
+
+    assert_eq(from_utf8(r.get(rdb, "alpha".view()).unwrap()).unwrap(), "one", "alpha")
+    assert_eq(from_utf8(r.get(rdb, "beta".view()).unwrap()).unwrap(), "two", "beta")
+
+    remove_dir_all(dir).unwrap()
+
+// The claim that matters most about durability: it survived the environment being closed and
+// reopened, so it reached the file rather than living in a map somebody still had open.
+@test("a committed write survives closing and reopening the environment")
+durable()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+
+    write_one(dir, "k", "v")
+
+    val e = env(dir).unwrap()
+    val r = e.read().unwrap()
+    val db = r.db().unwrap()
+
+    assert_eq(from_utf8(r.get(db, "k".view()).unwrap()).unwrap(), "v",
+              "read back from a fresh environment")
+
+    remove_dir_all(dir).unwrap()
+
+@test("a key that is not there is NotFound, and find says None instead")
+missing()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    w.put(db, "here".view(), "yes".view()).unwrap()
+    w.commit().unwrap()
+
+    val r = e.read().unwrap()
+    val rdb = r.db().unwrap()
+
+    r.get(rdb, "gone".view()) match
+        Err(NotFound) -> ()
+        Ok(_)         -> assert(false, "a key nobody wrote should not be found")
+        Err(other)    -> assert(false, f"the wrong error: ${other}%s")
+
+    assert(r.find(rdb, "gone".view()).unwrap().is_none(), "find answers None")
+    assert(r.find(rdb, "here".view()).unwrap().is_some(), "and Some for one that is there")
+    assert(!r.has(rdb, "gone".view()).unwrap(), "has agrees")
+    assert(r.has(rdb, "here".view()).unwrap(), "both ways")
+
+    remove_dir_all(dir).unwrap()
+
+@test("overwrite false refuses a key that is already there and leaves the value alone")
+no_overwrite()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    w.put(db, "k".view(), "first".view()).unwrap()
+
+    w.put(db, "k".view(), "second".view(), overwrite = false) match
+        Err(KeyExists) -> ()
+        Ok(_)          -> assert(false, "a second write with overwrite off should be refused")
+        Err(other)     -> assert(false, f"the wrong error: ${other}%s")
+
+    assert_eq(from_utf8(w.get(db, "k".view()).unwrap()).unwrap(), "first",
+              "and the value is untouched")
+
+    w.commit().unwrap()
+    remove_dir_all(dir).unwrap()
+
+@test("a key can be deleted")
+deleting()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    w.put(db, "k".view(), "v".view()).unwrap()
+    w.delete(db, "k".view()).unwrap()
+
+    assert(w.find(db, "k".view()).unwrap().is_none(), "gone")
+
+    w.delete(db, "k".view()) match
+        Err(NotFound) -> ()
+        _             -> assert(false, "deleting it twice is NotFound")
+
+    w.commit().unwrap()
+    remove_dir_all(dir).unwrap()
+
+// ## Transactions
+
+@test("an aborted transaction changes nothing")
+abort_discards()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val setup = e.write().unwrap()
+    val db = setup.db().unwrap()
+
+    setup.put(db, "keep".view(), "yes".view()).unwrap()
+    setup.commit().unwrap()
+
+    val w = e.write().unwrap()
+    val wdb = w.db().unwrap()
+
+    w.put(wdb, "throw".view(), "away".view()).unwrap()
+    w.abort()
+
+    val r = e.read().unwrap()
+    val rdb = r.db().unwrap()
+
+    assert(r.find(rdb, "throw".view()).unwrap().is_none(), "the aborted write is not there")
+    assert(r.find(rdb, "keep".view()).unwrap().is_some(), "and the committed one still is")
+
+    remove_dir_all(dir).unwrap()
+
+// **This is the safe-default claim the file header makes**, and it is worth a test of its own
+// because it is what makes an early `?` out of the middle of a write harmless. Nothing calls
+// `abort` here — the transaction simply goes out of scope.
+@test("a transaction that is merely dropped aborts")
+drop_aborts()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    dropped_write(e)
+
+    val r = e.read().unwrap()
+    val db = r.db().unwrap()
+
+    assert(r.find(db, "never".view()).unwrap().is_none(),
+           "a write nobody committed is not in the database")
+
+    remove_dir_all(dir).unwrap()
+
+@test("committing twice is refused rather than crashing LMDB")
+double_commit()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    w.put(db, "k".view(), "v".view()).unwrap()
+    w.commit().unwrap()
+
+    w.commit() match
+        Err(BadTxn) -> ()
+        Ok(_)       -> assert(false, "a spent transaction cannot commit again")
+        Err(other)  -> assert(false, f"the wrong error: ${other}%s")
+
+    remove_dir_all(dir).unwrap()
+
+// **The one claim that is really about LMDB rather than about this binding.** A reader sees the
+// database as it was when it began, however much is committed afterwards — that is what
+// multi-version concurrency control buys, and it is the reason readers never block writers.
+@test("a read transaction sees a snapshot, and a later commit does not disturb it")
+snapshot_isolation()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+
+    // **`no_tls` is required here and the reason is worth knowing.** By default a thread gets one
+    // reader slot, so the second `read()` on this thread would be refused with `BadRslot` —
+    // measured, not guessed. Two readers at once is exactly what a snapshot claim needs.
+    val e = env(dir, no_tls = true).unwrap()
+
+    val setup = e.write().unwrap()
+    val sdb = setup.db().unwrap()
+
+    setup.put(sdb, "n".view(), "before".view()).unwrap()
+    setup.commit().unwrap()
+
+    // The reader begins here, and everything below happens after it.
+    val r = e.read().unwrap()
+    val rdb = r.db().unwrap()
+
+    assert_eq(from_utf8(r.get(rdb, "n".view()).unwrap()).unwrap(), "before", "what it began with")
+
+    val w = e.write().unwrap()
+    val wdb = w.db().unwrap()
+
+    w.put(wdb, "n".view(), "after".view()).unwrap()
+    w.put(wdb, "fresh".view(), "row".view()).unwrap()
+    w.commit().unwrap()
+
+    assert_eq(from_utf8(r.get(rdb, "n".view()).unwrap()).unwrap(), "before",
+              "the reader still sees the value it started with")
+    assert(r.find(rdb, "fresh".view()).unwrap().is_none(),
+           "and cannot see a row committed after it began")
+
+    // A reader that starts now does see it, which is what makes the above isolation rather than a
+    // stale cache.
+    val r2 = e.read().unwrap()
+    val r2db = r2.db().unwrap()
+
+    assert_eq(from_utf8(r2.get(r2db, "n".view()).unwrap()).unwrap(), "after",
+              "a new reader sees the write")
+
+    remove_dir_all(dir).unwrap()
+
+// ## Databases
+
+@test("named databases are separate stores in one file")
+named_databases()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir, max_dbs = 4).unwrap()
+
+    val w = e.write().unwrap()
+    val users = w.db(Some("users")).unwrap()
+    val posts = w.db(Some("posts")).unwrap()
+
+    w.put(users, "1".view(), "ed".view()).unwrap()
+    w.put(posts, "1".view(), "hello".view()).unwrap()
+    w.commit().unwrap()
+
+    val r = e.read().unwrap()
+    val ru = r.db(Some("users"), create = false).unwrap()
+    val rp = r.db(Some("posts"), create = false).unwrap()
+
+    assert_eq(from_utf8(r.get(ru, "1".view()).unwrap()).unwrap(), "ed",
+              "the same key in one store")
+    assert_eq(from_utf8(r.get(rp, "1".view()).unwrap()).unwrap(), "hello",
+              "means something else in the other")
+
+    remove_dir_all(dir).unwrap()
+
+// `max_dbs` defaults to zero, which is LMDB's own default and means the unnamed database only. The
+// refusal is worth pinning because the message a caller gets otherwise looks like a missing file.
+@test("asking for a named database without room for one is DbsFull")
+no_room_for_named()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+
+    w.db(Some("nope")) match
+        Err(DbsFull) -> ()
+        Ok(_)        -> assert(false, "max_dbs was zero, so there is no room for a named database")
+        Err(other)   -> assert(false, f"the wrong error: ${other}%s")
+
+    remove_dir_all(dir).unwrap()
+
+@test("clear empties a database and stat counts what is in one")
+clearing()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    for i in 0..<10
+        w.put(db, f"k${i}%d".view(), "v".view()).unwrap()
+
+    assert_eq(w.stat(db).unwrap().entries, 10usize, "ten rows")
+
+    w.clear(db).unwrap()
+
+    assert_eq(w.stat(db).unwrap().entries, 0usize, "and none after clearing")
+
+    w.commit().unwrap()
+    remove_dir_all(dir).unwrap()
+
+// ## Cursors
+
+@test("a cursor walks every key in order")
+cursor_walk()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    // Written out of order on purpose: LMDB is an ordered store and the walk must not depend on
+    // insertion order.
+    w.put(db, "c".view(), "3".view()).unwrap()
+    w.put(db, "a".view(), "1".view()).unwrap()
+    w.put(db, "d".view(), "4".view()).unwrap()
+    w.put(db, "b".view(), "2".view()).unwrap()
+    w.commit().unwrap()
+
+    val r = e.read().unwrap()
+    val rdb = r.db().unwrap()
+    val cur = r.cursor(rdb).unwrap()
+
+    var seen = ""
+    var at = cur.first().unwrap()
+
+    loop
+        at match
+            None -> break
+            Some(entry) ->
+                seen = seen + from_utf8(entry.key).unwrap()
+                at = cur.next().unwrap()
+
+    assert_eq(seen, "abcd", "bytewise key order, not insertion order")
+
+    remove_dir_all(dir).unwrap()
+
+@test("a cursor walks backwards from the last key too")
+cursor_backwards()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    for i in 0..<4
+        w.put(db, f"k${i}%d".view(), "v".view()).unwrap()
+
+    w.commit().unwrap()
+
+    val r = e.read().unwrap()
+    val rdb = r.db().unwrap()
+    val cur = r.cursor(rdb).unwrap()
+
+    var seen = ""
+    var at = cur.last().unwrap()
+
+    loop
+        at match
+            None -> break
+            Some(entry) ->
+                seen = seen + from_utf8(entry.key).unwrap()
+                at = cur.prev().unwrap()
+
+    assert_eq(seen, "k3k2k1k0", "backwards")
+
+    remove_dir_all(dir).unwrap()
+
+// **This is what a cursor is really for**, and what repeated `get`s cannot do: land on a prefix and
+// walk only what belongs to it.
+@test("seek_range lands on a prefix and a walk collects exactly that range")
+cursor_range()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    w.put(db, "apple".view(), "a".view()).unwrap()
+    w.put(db, "user:1".view(), "one".view()).unwrap()
+    w.put(db, "user:2".view(), "two".view()).unwrap()
+    w.put(db, "user:3".view(), "three".view()).unwrap()
+    w.put(db, "zebra".view(), "z".view()).unwrap()
+    w.commit().unwrap()
+
+    val r = e.read().unwrap()
+    val rdb = r.db().unwrap()
+    val cur = r.cursor(rdb).unwrap()
+
+    var found = 0
+    var at = cur.seek_range("user:".view()).unwrap()
+
+    loop
+        at match
+            None -> break
+            Some(entry) ->
+                val k = from_utf8(entry.key).unwrap()
+
+                if !k.starts_with("user:") then break
+
+                found += 1
+                at = cur.next().unwrap()
+
+    assert_eq(found, 3, "three users, and neither the apple before them nor the zebra after")
+
+    remove_dir_all(dir).unwrap()
+
+@test("seek finds an exact key and answers None for one that is not there")
+cursor_seek()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    w.put(db, "b".view(), "two".view()).unwrap()
+    w.commit().unwrap()
+
+    val r = e.read().unwrap()
+    val rdb = r.db().unwrap()
+    val cur = r.cursor(rdb).unwrap()
+
+    cur.seek("b".view()).unwrap() match
+        Some(entry) -> assert_eq(from_utf8(entry.value).unwrap(), "two", "found it")
+        None        -> assert(false, "b is in the database")
+
+    assert(cur.seek("q".view()).unwrap().is_none(), "q is not")
+
+    remove_dir_all(dir).unwrap()
+
+// ## Duplicate keys
+
+@test("a dup_sort database keeps several values under one key, in order")
+duplicates()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir, max_dbs = 2).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db(Some("tags"), dup_sort = true).unwrap()
+
+    w.put(db, "post".view(), "zeta".view()).unwrap()
+    w.put(db, "post".view(), "alpha".view()).unwrap()
+    w.put(db, "post".view(), "mu".view()).unwrap()
+    w.commit().unwrap()
+
+    val r = e.read().unwrap()
+    val rdb = r.db(Some("tags"), create = false, dup_sort = true).unwrap()
+    val cur = r.cursor(rdb).unwrap()
+
+    var seen = ""
+    var at = cur.seek("post".view()).unwrap()
+
+    assert_eq(cur.count().unwrap(), 3usize, "three values under one key")
+
+    loop
+        at match
+            None -> break
+            Some(entry) ->
+                seen = seen + from_utf8(entry.value).unwrap() + " "
+                at = cur.next_value().unwrap()
+
+    assert_eq(seen, "alpha mu zeta ", "the values are sorted too, not kept in insertion order")
+
+    remove_dir_all(dir).unwrap()
+
+@test("one value of a duplicated key can be deleted, leaving the others")
+delete_one_duplicate()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir, max_dbs = 2).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db(Some("tags"), dup_sort = true).unwrap()
+
+    w.put(db, "k".view(), "a".view()).unwrap()
+    w.put(db, "k".view(), "b".view()).unwrap()
+    w.delete_value(db, "k".view(), "a".view()).unwrap()
+    w.commit().unwrap()
+
+    val r = e.read().unwrap()
+    val rdb = r.db(Some("tags"), create = false, dup_sort = true).unwrap()
+
+    assert_eq(from_utf8(r.get(rdb, "k".view()).unwrap()).unwrap(), "b",
+              "the other value survived")
+
+    remove_dir_all(dir).unwrap()
+
+// ## Ending a transaction with a cursor still open
+//
+// These two are the regression tests for a crash *and* a leak this binding had, one after the
+// other. `TxnHandle` carries the whole story; in short, LMDB frees the transaction structure when a
+// transaction ends and `mdb_cursor_close` reads the transaction out of the cursor, so closing a
+// cursor afterwards is a use-after-free — and simply skipping the close leaks, because a read
+// transaction's cursors are not LMDB's to free.
+
+@test("a cursor outliving an explicit abort is closed safely rather than twice")
+cursor_outlives_abort()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    w.put(db, "k".view(), "v".view()).unwrap()
+    w.commit().unwrap()
+
+    val r = e.read().unwrap()
+    val rdb = r.db().unwrap()
+    val cur = r.cursor(rdb).unwrap()
+
+    assert(cur.first().unwrap().is_some(), "the cursor works while the transaction is open")
+
+    // The transaction ends here with the cursor still in scope. What matters happens when `cur` is
+    // destroyed at the end of this test.
+    r.abort()
+
+    assert(true, "reaching the end of this test without a fault is the assertion")
+
+    remove_dir_all(dir).unwrap()
+
+// The same shape on a write transaction, which is a different path through LMDB and the same
+// hazard.
+@test("a cursor outliving an explicit commit is closed safely too")
+cursor_outlives_commit()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+    val cur = w.cursor(db).unwrap()
+
+    cur.put("k".view(), "v".view()).unwrap()
+
+    w.commit().unwrap()
+
+    assert(true, "reaching the end of this test without a fault is the assertion")
+
+    remove_dir_all(dir).unwrap()
+
+// **A leak measurement is usually the only check there is**, because every operation is correct
+// whether or not a handle is released. This one is the exception the org file names: LMDB counts
+// reader slots itself, so a read transaction that failed to end is something the *other end* can
+// see. With `no_tls` each live reader takes its own slot and the default table holds 126, so a
+// thousand readers that were not being released redden this with `ReadersFull` rather than needing
+// a stopwatch. Checked by disabling `TxnHandle`'s destructor on purpose: it fails.
+@test("a thousand read transactions in turn do not exhaust the reader table")
+readers_are_released()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir, no_tls = true).unwrap()
+
+    val setup = e.write().unwrap()
+    val db = setup.db().unwrap()
+
+    setup.put(db, "k".view(), "v".view()).unwrap()
+    setup.commit().unwrap()
+
+    for i in 0..<1000
+        val r = e.read().unwrap()
+        val rdb = r.db().unwrap()
+        val cur = r.cursor(rdb).unwrap()
+
+        assert(cur.first().unwrap().is_some(), f"round ${i}%d read the row")
+
+        // Nothing is closed by hand: the transaction and its cursor go out of scope here, and the
+        // next round needs the slot this one held.
+
+    val info = e.info().unwrap()
+
+    assert(info.readers <= info.max_readers,
+           f"${info.readers}%d slots in use of ${info.max_readers}%d")
+
+    remove_dir_all(dir).unwrap()
+
+// ## The environment itself
+
+@test("a key longer than LMDB will take is refused rather than truncated")
+key_too_long()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val limit = e.max_key_size()
+
+    // **Asked rather than assumed.** 511 is the figure every LMDB 0.9 document quotes and it is
+    // wrong here — this build answers 8122, because the limit comes from the page size. The first
+    // version of this test carried a 4096-byte buffer and a `limit + 1` slice, and died with a
+    // bounds violation rather than a failed assertion.
+    assert(limit > 0, f"LMDB reports a maximum key size of ${limit}%d")
+    assert(limit < 16384, f"and it fits in the buffer below: ${limit}%d")
+
+    var big: [16384]u8 = [65; 16384]
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    w.put(db, big[0..<usize(limit + 1)], "v".view()) match
+        Err(BadValSize) -> ()
+        Ok(_)           -> assert(false, f"a key of ${limit}%d + 1 bytes should be refused")
+        Err(other)      -> assert(false, f"the wrong error: ${other}%s")
+
+    // One exactly at the limit is fine, which is what makes the above a boundary rather than a
+    // blanket refusal.
+    w.put(db, big[0..<usize(limit)], "v".view()).unwrap()
+
+    w.commit().unwrap()
+    remove_dir_all(dir).unwrap()
+
+// The default is one reader slot per thread, and a second reader on one thread is refused. It is
+// worth its own test because the message — "Invalid reuse of reader locktable slot" — reads as a
+// damaged lock file rather than as the deliberate design it is.
+@test("without no_tls a thread may hold only one read transaction")
+one_reader_per_thread()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    w.put(db, "k".view(), "v".view()).unwrap()
+    w.commit().unwrap()
+
+    val first = e.read().unwrap()
+
+    e.read() match
+        Err(BadRslot) -> ()
+        Ok(_)         -> assert(false, "a second reader on this thread should want no_tls")
+        Err(other)    -> assert(false, f"the wrong error: ${other}%s")
+
+    // And with `no_tls` the same thing is allowed, which is what makes the refusal a setting rather
+    // than a limit.
+    val dir2 = make_temp_dir("sysl-lmdb-").unwrap()
+    val e2 = env(dir2, no_tls = true).unwrap()
+
+    val w2 = e2.write().unwrap()
+    val db2 = w2.db().unwrap()
+
+    w2.put(db2, "k".view(), "v".view()).unwrap()
+    w2.commit().unwrap()
+
+    val a = e2.read().unwrap()
+    val b = e2.read().unwrap()
+
+    assert(a.id() > 0, "both readers are live at once")
+    assert(b.id() > 0, "and neither was refused")
+
+    remove_dir_all(dir).unwrap()
+    remove_dir_all(dir2).unwrap()
+
+@test("info reports the map size the environment was opened with")
+env_info()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val wanted: usize = 4 * 1024 * 1024
+    val e = env(dir, map_size = wanted).unwrap()
+
+    val i = e.info().unwrap()
+
+    assert_eq(i.map_size, wanted, "the ceiling is what was asked for")
+    assert(i.max_readers > 0, "there are reader slots")
+
+    remove_dir_all(dir).unwrap()
+
+// The map size is a hard ceiling rather than a hint, which is the single most surprising thing
+// about LMDB for somebody arriving from a database that grows itself.
+@test("writing past the map size is MapFull, not a larger file")
+map_is_a_ceiling()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir, map_size = 64 * 1024).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    var big: [8192]u8 = [66; 8192]
+    var wrote = 0
+    var full = false
+
+    for i in 0..<64
+        w.put(db, f"k${i}%d".view(), big[0..<big.len]) match
+            Ok(_)        -> wrote += 1
+            Err(MapFull) -> full = true
+            Err(other)   -> assert(false, f"the wrong error: ${other}%s")
+
+        if full then break
+
+    assert(full, f"a 64 KiB map cannot hold 64 rows of 8 KiB; it took ${wrote}%d before saying so")
+
+    w.abort()
+    remove_dir_all(dir).unwrap()
+
+@test("a no_subdir environment is one file rather than a directory of two")
+single_file()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val path = dir + "/store.mdb"
+    val e = env(path, no_subdir = true).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    w.put(db, "k".view(), "v".view()).unwrap()
+    w.commit().unwrap()
+
+    assert(exists(path), "the file is where it was asked for")
+
+    remove_dir_all(dir).unwrap()
+
+@test("clearing stale readers answers a number and disturbs nothing")
+stale_readers()
+    val dir = make_temp_dir("sysl-lmdb-").unwrap()
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    w.put(db, "k".view(), "v".view()).unwrap()
+    w.commit().unwrap()
+
+    assert_eq(e.clear_stale_readers().unwrap(), 0, "nothing died, so nothing is stale")
+
+    val r = e.read().unwrap()
+    val rdb = r.db().unwrap()
+
+    assert_eq(from_utf8(r.get(rdb, "k".view()).unwrap()).unwrap(), "v", "and the data is untouched")
+
+    remove_dir_all(dir).unwrap()
+
+// ## Helpers
+
+// Opens an environment, writes one pair, commits, and lets the environment go — so that the caller
+// can prove the write survived the close.
+private write_one(dir: string, key: string, value: string)
+    val e = env(dir).unwrap()
+
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    w.put(db, key.view(), value.view()).unwrap()
+    w.commit().unwrap()
+
+// Writes into a transaction and returns without committing it, so that the transaction is dropped
+// at the end of this call and nothing else does.
+private dropped_write(e: Env)
+    val w = e.write().unwrap()
+    val db = w.db().unwrap()
+
+    w.put(db, "never".view(), "committed".view()).unwrap()
