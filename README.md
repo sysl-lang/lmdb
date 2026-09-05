@@ -24,7 +24,7 @@ unusually clean binding target, and *The boundary* below says why.
 
 ```hocon
 dependencies {
-  lmdb { git = "github.com/sysl-lang/lmdb", version = "0.1.0" }
+  lmdb { git = "github.com/sysl-lang/lmdb", version = "0.2.0" }
 }
 ```
 
@@ -133,23 +133,36 @@ using the handle, and LMDB intends a handle to live for as long as the process.
 
 ## Two things that cost real time, written down so they cost nobody else any
 
-### A method cannot reach the box it is inside
+### A method CAN reach the box it was called through, and this binding did not know it
 
-`Env`, `Txn` and `Cursor` are each **two types** — a private `…Handle` that owns the C pointer and
-has the destructor, and a plain copyable value holding a `&` to one. That reads like ceremony and is
-forced.
+`Env`, `Txn` and `Cursor` are one type each, and each carries its own destructor. Handing a
+resource to a value that outlives the call is what the **`&self`** receiver is for:
 
-A `&Env` method receives `self` by value, so there is no way for `read()` to put *the box it was
-called on* into the transaction it is building. The obvious move — construct a fresh `Env` around
-the same pointer — compiles, links, and hands out a **second owner** of one `MDB_env`: two boxes,
-two counts, two calls to `mdb_env_close`. This binding was written that way first, and every test
-that opened a transaction died with a `SIGTRAP` inside LMDB while the four that never opened one
-passed.
+```sysl
+private begin(&self, flags: uint) -> Result[&Txn, Error] = … Ok(Txn(t, self, false, buf()))
+```
 
-Splitting the ownership out fixes it exactly, and the `&` fields then buy the nesting for free: a
-`TxnHandle` holds a `&EnvHandle` and a `CursorHandle` holds a `&TxnHandle`, so an environment cannot
-be closed while a transaction is open and a transaction cannot end while a cursor is live. The three
-closes are ordered by construction rather than by a comment asking for it.
+`&self` is given the box rather than a copy of the value, so the transaction takes a **share** of
+the environment instead of becoming a second owner of it.
+
+**Until v0.2.0 this was three *pairs* of types** — a private `…Handle` owning the C pointer and
+carrying the destructor, plus a copyable value holding a `&` to it — and this section asserted that
+the split was forced, because a method receives `self` by value and cannot name the box it was
+called through. **The first half of that is true and the conclusion was wrong.** `&self` was
+already in the language; nobody tried it. What made the mistake durable is that the workaround
+*worked*, so nothing ever failed to say otherwise.
+
+The underlying hazard is real and worth keeping: constructing a fresh `Env` around the same pointer
+compiles, links, and hands out a **second owner** of one `MDB_env` — two boxes, two counts, two
+calls to `mdb_env_close`. This binding was written that way first, and every test that opened a
+transaction died with a `SIGTRAP` inside LMDB while the four that never opened one passed.
+
+The `&` fields still buy the nesting for free: a `Txn` holds a `&Env` and a `Cursor` holds a `&Txn`,
+so an environment cannot be closed while a transaction is open and a transaction cannot end while a
+cursor is live. The three closes are ordered by construction rather than by a comment asking for it.
+
+`reference/declarations.md § A '&self' method may keep what it was called on` is where this is now
+written down, and `reference/memory.md`'s destructor section points at it.
 
 ### Ending a transaction with a cursor open: a crash, then a leak
 
@@ -214,9 +227,12 @@ them. What ASan covers here is **the sysl half**: the `MDB_val` handling, the ra
 the slices handed back out of the map. That is the right half to watch — it is the half this
 repository wrote — but it is not a statement about LMDB's B+tree.
 
-> A green ASan run over an unchanged tree proves nothing: `sysl test` caches its artifact and the key
-> does not include `SYSL_EXTRA_CFLAGS`, so the flag is silently ignored and the uninstrumented binary
-> reused. Check `nm -u <binary> | grep -c asan` before believing one. Filed as card 0415.
+> **Before sysl 0.0.104** a green ASan run over an unchanged tree proved nothing: `sysl test` cached
+> its artifact and the key did not include `SYSL_EXTRA_CFLAGS`, so the flag was silently ignored and
+> the uninstrumented binary replayed. Fixed in 0.0.104 — the environment that reaches the toolchain
+> is part of the key now, so a sanitizer run rebuilds. `nm -u <binary> | grep -c asan` is still
+> worth running, and now answers the question it was always best at: *is this binary instrumented*,
+> rather than *was I handed last week's*.
 
 ## Not bound yet
 

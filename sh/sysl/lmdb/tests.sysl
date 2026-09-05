@@ -763,7 +763,7 @@ private write_one(dir: string, key: string, value: string)
 
 // Writes into a transaction and returns without committing it, so that the transaction is dropped
 // at the end of this call and nothing else does.
-private dropped_write(e: Env)
+private dropped_write(e: &Env)
     val w = e.write().unwrap()
     val db = w.db().unwrap()
 

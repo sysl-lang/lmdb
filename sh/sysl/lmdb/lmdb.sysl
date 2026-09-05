@@ -272,76 +272,80 @@ end Info
 struct Db
     private dbi: uint
 end Db
-// ==Why each of the three resources is TWO types==
+// ==Each resource is ONE type, and the receiver that makes that possible is `&self`==
 //
-// `EnvHandle` owns the C pointer and has the destructor; `Env` is a plain value holding a `&` to
-// one. The same for `TxnHandle`/`Txn` and `CursorHandle`/`Cursor`. It reads like ceremony and it is
-// forced, by something worth knowing before designing any binding whose handles nest:
+// `Env`, `Txn` and `Cursor` each own their C pointer and each carry their own destructor. What lets
+// a method hand its own resource to the value it is building is the **`&self` receiver**: a `self`
+// method has a *copy* and cannot name the box it was called through, so `read()` written that way
+// would have to construct a fresh `Env` around the same pointer — which compiles, links, and hands
+// out a **second owner** of one `MDB_env`: two boxes, two counts, two calls to `mdb_env_close`.
+// This binding was written that way first, and every test that opened a transaction died with a
+// `SIGTRAP` inside LMDB while the four that never opened one passed.
 //
-// **A method cannot reach the box it is inside.** A `&Env` method receives `self` by value, so
-// there is no way for `read()` to put *the box it was called on* into the transaction it is
-// building. The obvious move — construct a fresh `Env` around the same pointer — compiles, links,
-// and hands out a **second owner** of one `MDB_env`: two boxes, two counts, two calls to
-// `mdb_env_close`. This binding was written that way first, and every test that opened a
-// transaction died with a `SIGTRAP` inside LMDB while the four that never opened one passed.
+// `&self` is handed the box itself, so `Txn(t, self, …)` takes a **share** rather than a second
+// owner:
 //
-// Splitting the ownership out fixes it exactly. `Env` is copyable and cheap — copying it copies a
-// `&EnvHandle`, which is a count — so a method *can* pass `self.h` downward, and there is only ever
-// one owner of the C pointer no matter how many `Env` values exist.
+//     begin(&self, flags: uint) -> Result[&Txn, Error] = … Ok(Txn(t, self, false, buf()))
 //
-// **The nesting is what the `&` fields buy.** A `TxnHandle` holds a `&EnvHandle` and a
-// `CursorHandle` holds a `&TxnHandle`, so the three closes are ordered by construction: an
-// environment cannot be closed while a transaction is open, and a transaction cannot end while a
-// cursor is live. Nothing has to remember to do it in the right order, and no comment has to ask.
-
-// The environment's C pointer, and the only thing that closes it.
-private struct EnvHandle
-    private e: *c.Env
-
-    private raw(self) -> *c.Env = self.e
-end EnvHandle
-
-impl Drop for EnvHandle
-    drop(self)
-        c.env_close(self.e)
-    end drop
+// **Until v0.2.0 this was three PAIRS of types** — a private `EnvHandle` carrying the destructor
+// plus a copyable `Env` holding a `&` to it, and the same twice more — with a long comment here
+// asserting that a method cannot reach its own box and that the split was therefore forced. The
+// assertion was false when it was written: `&self` was already in the language, and nobody had
+// tried it. The split worked, so nothing ever failed to say so. See
+// `reference/declarations.md § A '&self' method may keep what it was called on`.
+//
+// **The nesting is what the `&` fields buy, and it is unchanged.** A `Txn` holds a `&Env` and a
+// `Cursor` holds a `&Txn`, so the three closes are ordered by construction: an environment cannot
+// be closed while a transaction is open, and a transaction cannot end while a cursor is live.
+// Nothing has to remember to do it in the right order, and no comment has to ask.
+//
+// **What it costs a caller is one character**, and it is in the signatures rather than in the
+// calls: `read()` answers `&Txn` where it used to answer `Txn`, because a type with a destructor
+// returned by value is a destructor that never runs. Chained use — `env.read()?.get(db, key)` — is
+// untouched.
 
 // An open LMDB environment: one directory, one map, and every database inside it.
 //
-// Copying one is free and copies no data — it is a reference to the same environment.
+// Held as a `&Env`: it owns the `MDB_env` and closes it when the last share goes, which is after
+// the last transaction opened from it has ended.
 struct Env
-    private h: &EnvHandle
+    private e: *c.Env
+
+    private raw(self) -> *c.Env = self.e
 
     // Begins a read-only transaction, which takes no lock and blocks nothing.
     //
     // It sees the database as it was at this moment and will keep seeing that however long it is
     // held. **Holding one open for a long time is how an LMDB file grows without bound**, because
     // the pages it can still see cannot be reused; a reader that is finished should end.
-    read(self) -> Result[Txn, Error] = self.begin(c.RDONLY)
+    read(&self) -> Result[&Txn, Error] = self.begin(c.RDONLY)
 
     // Begins a read-write transaction. **There is one writer at a time** across the whole
     // environment and across every process using it, so this blocks until the current one finishes.
-    write(self) -> Result[Txn, Error] = self.begin(0)
+    write(&self) -> Result[&Txn, Error] = self.begin(0)
 
-    private begin(self, flags: uint) -> Result[Txn, Error]
+    // `&self` rather than `self`, and it is the whole reason this binding is three types rather than
+    // six: the transaction is handed **this box** and takes a share of it, so the environment cannot
+    // be closed while the transaction is open and there is still exactly one owner of the pointer.
+    private begin(&self, flags: uint) -> Result[&Txn, Error]
         var t: *c.Txn = ptr_cast(0usize)
 
-        checked(c.txn_begin(self.h.raw(), ptr_cast(0usize), flags, &t))?
+        checked(c.txn_begin(self.raw(), ptr_cast(0usize), flags, &t))?
 
-        Ok(Txn(TxnHandle(t, self.h, false, buf())))
+        Ok(Txn(t, self, false, buf()))
 
     // Flushes the map to disk. Pointless unless the environment was opened `no_sync` or
     // `write_map`, since a commit already does it otherwise.
     //
     // `force` asks for a real flush even where the environment's flags say it may be skipped.
     sync(self, force: bool = true) -> Result[unit, Error] =
-        checked(c.env_sync(self.h.raw(), if force then 1 else 0))
+        checked(c.env_sync(self.raw(), if force then 1 else 0))
 
     // What the environment's main database looks like.
     stat(self) -> Result[Stat, Error]
         var s = c.Stat(0, 0, 0, 0, 0, 0)
 
-        checked(c.env_stat(self.h.raw(), &s))?
+        checked(c.env_stat(self.raw(), &s))?
 
         Ok(Stat(s.psize, s.depth, s.branch_pages, s.leaf_pages, s.overflow_pages, s.entries))
 
@@ -349,7 +353,7 @@ struct Env
     info(self) -> Result[Info, Error]
         var i = c.EnvInfo(ptr_cast(0usize), 0, 0, 0, 0, 0)
 
-        checked(c.env_info(self.h.raw(), &i))?
+        checked(c.env_info(self.raw(), &i))?
 
         Ok(Info(i.mapsize, i.last_pgno, i.last_txnid, i.maxreaders, i.numreaders))
 
@@ -361,24 +365,29 @@ struct Env
     // larger pages answers 8122. A binding that hard-coded the old number would refuse keys LMDB
     // would have taken, and a test written around it walks off the end of its own buffer — which is
     // how this comment came to be here.
-    max_key_size(self) -> int = c.env_get_maxkeysize(self.h.raw())
+    max_key_size(self) -> int = c.env_get_maxkeysize(self.raw())
 
     // Copies the whole environment to a directory, which is LMDB's hot backup: it runs against a
     // live environment and produces a consistent snapshot without stopping anybody.
     copy_to(self, path: string) -> Result[unit, Error]
         val p = cstring(path)
 
-        checked(c.env_copy(self.h.raw(), p.ptr))
+        checked(c.env_copy(self.raw(), p.ptr))
 
     // Clears reader slots left behind by processes that died, and answers how many it cleared.
     // Worth calling at startup where a crash may have left stale readers pinning old pages.
     clear_stale_readers(self) -> Result[int, Error]
         var dead = 0
 
-        checked(c.reader_check(self.h.raw(), &dead))?
+        checked(c.reader_check(self.raw(), &dead))?
 
         Ok(dead)
 end Env
+
+impl Drop for Env
+    drop(self)
+        c.env_close(self.e)
+    end drop
 
 // Opens an environment at `path`.
 //
@@ -403,18 +412,20 @@ end Env
 // The cost is that a read transaction then belongs to whoever holds it rather than to a thread.
 env(path: string, map_size: usize = 10 * 1024 * 1024, max_dbs: uint = 0,
     read_only: bool = false, no_subdir: bool = false, no_sync: bool = false,
-    write_map: bool = false, no_tls: bool = false, mode: uint = 0o644) -> Result[Env, Error]
+    write_map: bool = false, no_tls: bool = false, mode: uint = 0o644) -> Result[&Env, Error]
 
     var e: *c.Env = ptr_cast(0usize)
 
     checked(c.env_create(&e))?
 
     // **From here on a failure has to close the environment by hand**, because nothing owns it yet:
-    // the `EnvHandle` that would have a destructor is only built on the success path below.
+    // the `Env` that carries the destructor is only built on the success path below. A `Drop` runs
+    // when a *box's* count reaches zero, so on the error path no box is ever made and there is
+    // nothing for one to hang off.
     val opened = open_into(e, path, map_size, max_dbs, read_only, no_subdir, no_sync, write_map, no_tls, mode)
 
     opened match
-        Ok(_) -> Ok(Env(EnvHandle(e)))
+        Ok(_) -> Ok(Env(e))
         Err(why) ->
             c.env_close(e)
             Err(why)
@@ -459,24 +470,33 @@ private open_into(e: *c.Env, path: string, map_size: usize, max_dbs: uint,
 // a transaction closes every cursor still open in it, and a cursor destroyed first takes itself off
 // the list. A caller can then commit or abort with cursors live, or drop them in any order, and
 // both the crash and the leak are gone.
-private struct TxnHandle
+// A transaction. Everything read or written goes through one.
+//
+// It ends exactly once — `commit`, `abort`, or being dropped.
+//
+// **A transaction that is merely dropped aborts.** That is the safe way round: an early return out
+// of the middle of a sequence of writes leaves the database as it was, and a caller who meant to
+// keep the work has already said so with `commit`.
+struct Txn
     private t: *c.Txn
 
     // The environment, held strongly, so that it cannot be closed while this transaction is open.
-    private env: &EnvHandle
+    // This is the box `Env.begin` was called through — see the `&self` note at the top of the file.
+    private env: &Env
 
     private ended: bool
 
-    // The address of every cursor open in this transaction. Addresses rather than handles, because
-    // a handle here would be a reference cycle — a `CursorHandle` already holds this one.
+    // The address of every cursor open in this transaction. Addresses rather than references,
+    // because a `&Cursor` here would be a cycle — a `Cursor` already holds a `&Txn`.
     private live: Buf[usize]
 
     private raw(self) -> *c.Txn = self.t
     private is_ended(self) -> bool = self.ended
 
-    // Mutating through the box is what makes the split work: every `Txn` value copied from another
-    // points at *this* handle, so a `commit` through any of them is seen by all of them and by the
-    // destructor.
+    // **Mutating through the box is what makes one type enough.** A caller holds a `&Txn`, so a
+    // `*self` method writes the transaction everybody is looking at rather than a copy — the write
+    // is seen by every later read and by the destructor. That is why `ended` can live here now
+    // instead of in a separate owning handle.
     private track(*self, cur: *c.Cursor)
         self.live.push(usize(cur))
 
@@ -491,9 +511,10 @@ private struct TxnHandle
 
             i += 1
 
-    // Closes every cursor still open, then marks the transaction spent. Called by `commit`, by
-    // `abort`, and by the destructor — so there is no path that ends a transaction and leaves a
-    // cursor pointing at freed memory.
+    // Closes every cursor still open, then marks the transaction spent. Called by `commit` and by
+    // `abort`, so there is no path that ends a transaction and leaves a cursor pointing at freed
+    // memory. The destructor does not need it: a `Cursor` holds a `&Txn`, so no cursor can outlive
+    // the transaction's own count reaching zero.
     private end(*self)
         var i: usize = 0
 
@@ -504,39 +525,24 @@ private struct TxnHandle
         self.live.clear()
 
         self.ended = true
-end TxnHandle
-
-// **A transaction that is merely dropped aborts.** That is the safe way round: an early return out
-// of the middle of a sequence of writes leaves the database as it was, and a caller who meant to
-// keep the work has already said so with `commit`.
-impl Drop for TxnHandle
-    drop(self)
-        if !self.ended then c.txn_abort(self.t)
-    end drop
-
-// A transaction. Everything read or written goes through one.
-//
-// It ends exactly once — `commit`, `abort`, or being dropped.
-struct Txn
-    private h: &TxnHandle
 
     // Commits everything written in this transaction. After it, the transaction is spent and every
     // slice read through it is dangling.
-    commit(self) -> Result[unit, Error]
-        if self.h.is_ended() then return Err(BadTxn)
+    commit(*self) -> Result[unit, Error]
+        if self.is_ended() then return Err(BadTxn)
 
         // Closes every cursor still open first, which is what makes this safe to call with one
-        // live. `TxnHandle` says why at length.
-        self.h.end()
+        // live. The comment above this struct says why at length.
+        self.end()
 
-        checked(c.txn_commit(self.h.raw()))
+        checked(c.txn_commit(self.raw()))
 
     // Throws everything away. A dropped transaction does this by itself; calling it is how a caller
     // says so on purpose.
-    abort(self)
-        if !self.h.is_ended() then
-            self.h.end()
-            c.txn_abort(self.h.raw())
+    abort(*self)
+        if !self.is_ended() then
+            self.end()
+            c.txn_abort(self.raw())
 
     // Opens a database in this transaction.
     //
@@ -556,11 +562,11 @@ struct Txn
         var dbi: uint = 0
 
         val code = name match
-            None -> c.dbi_open(self.h.raw(), ptr_cast(0usize), flags, &dbi)
+            None -> c.dbi_open(self.raw(), ptr_cast(0usize), flags, &dbi)
             Some(n) ->
                 val s = cstring(n)
 
-                c.dbi_open(self.h.raw(), s.ptr, flags, &dbi)
+                c.dbi_open(self.raw(), s.ptr, flags, &dbi)
 
         checked(code)?
 
@@ -575,7 +581,7 @@ struct Txn
         var k = val_of(key)
         var v = empty_val()
 
-        checked(c.get(self.h.raw(), db.dbi, &k, &v))?
+        checked(c.get(self.raw(), db.dbi, &k, &v))?
 
         Ok(slice_of(v))
 
@@ -609,49 +615,56 @@ struct Txn
         var k = val_of(key)
         var v = val_of(value)
 
-        checked(c.put(self.h.raw(), db.dbi, &k, &v, flags))
+        checked(c.put(self.raw(), db.dbi, &k, &v, flags))
 
     // Deletes a key and everything under it. `NotFound` if it was not there.
     delete(self, db: Db, key: []const u8) -> Result[unit, Error]
         var k = val_of(key)
 
-        checked(c.del(self.h.raw(), db.dbi, &k, ptr_cast(0usize)))
+        checked(c.del(self.raw(), db.dbi, &k, ptr_cast(0usize)))
 
     // Deletes one value of a key in a `dup_sort` database, leaving the others.
     delete_value(self, db: Db, key: []const u8, value: []const u8) -> Result[unit, Error]
         var k = val_of(key)
         var v = val_of(value)
 
-        checked(c.del(self.h.raw(), db.dbi, &k, &v))
+        checked(c.del(self.raw(), db.dbi, &k, &v))
 
     // Empties a database, keeping the handle.
-    clear(self, db: Db) -> Result[unit, Error] = checked(c.drop_db(self.h.raw(), db.dbi, 0))
+    clear(self, db: Db) -> Result[unit, Error] = checked(c.drop_db(self.raw(), db.dbi, 0))
 
     // Empties a database and gives up its handle. After this the `Db` must not be used again.
-    destroy(self, db: Db) -> Result[unit, Error] = checked(c.drop_db(self.h.raw(), db.dbi, 1))
+    destroy(self, db: Db) -> Result[unit, Error] = checked(c.drop_db(self.raw(), db.dbi, 1))
 
     // What one database looks like.
     stat(self, db: Db) -> Result[Stat, Error]
         var s = c.Stat(0, 0, 0, 0, 0, 0)
 
-        checked(c.stat(self.h.raw(), db.dbi, &s))?
+        checked(c.stat(self.raw(), db.dbi, &s))?
 
         Ok(Stat(s.psize, s.depth, s.branch_pages, s.leaf_pages, s.overflow_pages, s.entries))
 
     // Opens a cursor over a database. A cursor is how a range, an ordered walk, or the several
     // values of one `dup_sort` key are reached.
-    cursor(self, db: Db) -> Result[Cursor, Error]
+    // `&self` for the same reason `Env.begin` takes one: the cursor is handed **this** transaction's
+    // box, so it holds a share of the thing it must not outlive.
+    cursor(&self, db: Db) -> Result[&Cursor, Error]
         var cur: *c.Cursor = ptr_cast(0usize)
 
-        checked(c.cursor_open(self.h.raw(), db.dbi, &cur))?
+        checked(c.cursor_open(self.raw(), db.dbi, &cur))?
 
-        self.h.track(cur)
+        self.track(cur)
 
-        Ok(Cursor(CursorHandle(cur, self.h)))
+        Ok(Cursor(cur, self))
 
     // This transaction's identifier — for a reader, the write transaction whose state it is seeing.
-    id(self) -> usize = c.txn_id(self.h.raw())
+    id(self) -> usize = c.txn_id(self.raw())
 end Txn
+
+impl Drop for Txn
+    drop(self)
+        if !self.ended then c.txn_abort(self.t)
+    end drop
 
 // One key and one value, as a cursor found them. **Both point into the memory map** and live only
 // as long as the transaction.
@@ -659,27 +672,6 @@ struct Entry
     key: []const u8
     value: []const u8
 end Entry
-
-// The cursor's C pointer and the transaction it belongs to.
-private struct CursorHandle
-    private cur: *c.Cursor
-
-    // The transaction, held strongly, so a cursor can never outlive it.
-    private txn: &TxnHandle
-
-    private raw(self) -> *c.Cursor = self.cur
-end CursorHandle
-
-// A cursor destroyed while its transaction is still open closes itself and comes off the
-// transaction's list, so that ending the transaction later does not close it a second time. One
-// destroyed afterwards does nothing at all — `TxnHandle.end` has already closed it, and closing it
-// again would read a transaction LMDB has freed.
-impl Drop for CursorHandle
-    drop(self)
-        if !self.txn.is_ended() then
-            self.txn.untrack(self.cur)
-            c.cursor_close(self.cur)
-    end drop
 
 // A position in a database, and the way to walk one in order.
 //
@@ -693,7 +685,14 @@ impl Drop for CursorHandle
 //                 print(from_utf8(e.key)?)
 //                 at = cur.next()?
 struct Cursor
-    private h: &CursorHandle
+    private cur: *c.Cursor
+
+    // The transaction, held strongly, so a cursor can never outlive it — and so the transaction's
+    // own destructor cannot run while one is live, which is what makes the cursor list safe to leave
+    // out of `Txn`'s `drop`.
+    private txn: &Txn
+
+    private raw(self) -> *c.Cursor = self.cur
 
     // The first entry in the database, or `None` if it is empty.
     first(self) -> Result[Option[Entry], Error] = self.step(c.FIRST)
@@ -738,19 +737,19 @@ struct Cursor
     count(self) -> Result[usize, Error]
         var n: usize = 0
 
-        checked(c.cursor_count(self.h.raw(), &n))?
+        checked(c.cursor_count(self.raw(), &n))?
 
         Ok(n)
 
     // Deletes the entry the cursor is on. The cursor stays where it was, so a `next` continues.
-    delete(self) -> Result[unit, Error] = checked(c.cursor_del(self.h.raw(), 0))
+    delete(self) -> Result[unit, Error] = checked(c.cursor_del(self.raw(), 0))
 
     // Writes through the cursor, which is how `dup_sort` values are added in order.
     put(self, key: []const u8, value: []const u8) -> Result[unit, Error]
         var k = val_of(key)
         var v = val_of(value)
 
-        checked(c.cursor_put(self.h.raw(), &k, &v, 0))
+        checked(c.cursor_put(self.raw(), &k, &v, 0))
 
     // Every move goes through here: `NotFound` is the end of the walk rather than a failure, which
     // is the whole difference between a cursor and a `get`.
@@ -758,7 +757,7 @@ struct Cursor
         var k = empty_val()
         var v = empty_val()
 
-        val code = c.cursor_get(self.h.raw(), &k, &v, op)
+        val code = c.cursor_get(self.raw(), &k, &v, op)
 
         if code == c.NOTFOUND then return Ok(None)
 
@@ -770,7 +769,7 @@ struct Cursor
         var k = val_of(key)
         var v = empty_val()
 
-        val code = c.cursor_get(self.h.raw(), &k, &v, op)
+        val code = c.cursor_get(self.raw(), &k, &v, op)
 
         if code == c.NOTFOUND then return Ok(None)
 
@@ -778,6 +777,17 @@ struct Cursor
 
         Ok(Some(Entry(slice_of(k), slice_of(v))))
 end Cursor
+
+// A cursor destroyed while its transaction is still open closes itself and comes off the
+// transaction's list, so that ending the transaction later does not close it a second time. One
+// destroyed afterwards does nothing at all — `Txn.end` has already closed it, and closing it again
+// would read a transaction LMDB has freed.
+impl Drop for Cursor
+    drop(self)
+        if !self.txn.is_ended() then
+            self.txn.untrack(self.cur)
+            c.cursor_close(self.cur)
+    end drop
 
 // The version of LMDB this program is linked against, as major, minor and patch.
 version() -> (int, int, int)
