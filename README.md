@@ -3,6 +3,8 @@
 The [Lightning Memory-Mapped Database](https://www.symas.com/lmdb) for
 [sysl](https://github.com/sysl-lang/sysl), bound to the library the machine has.
 
+*An independent sysl package for LMDB. It is not affiliated with or endorsed by LMDB's authors or trademark holders.*
+
 LMDB is an ordered key-value store in a memory-mapped file: a B+tree with copy-on-write pages and
 multi-version concurrency control. Readers never block writers and writers never block readers,
 there is exactly one writer at a time, and **a read is a pointer into the map rather than a copy**.
