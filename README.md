@@ -26,7 +26,7 @@ unusually clean binding target, and *The boundary* below says why.
 
 ```hocon
 dependencies {
-  lmdb { git = "github.com/sysl-lang/lmdb", version = "0.2.0" }
+  lmdb { git = "github.com/sysl-lang/lmdb", version = "0.2.1" }
 }
 ```
 
