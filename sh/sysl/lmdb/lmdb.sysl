@@ -2,6 +2,7 @@ module sh.sysl.lmdb
 
 import sh.sysl.lmdb.c
 import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
 import sysl.slices.as_ptr
 import sysl.text.{cstring, from_cstring}
 

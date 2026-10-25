@@ -16,7 +16,7 @@ sh/sysl/lmdb/
     tests.sysl      31 tests against a real LMDB
     c/
         c.sysl      LMDB as C declares it, and the numbers its header computes
-package.hocon       who this package is, and what it needs of the machine
+sysl.hocon          who this package is, and what it needs of the machine
 ```
 
 **There is no shim** — no `c/shim.c`, no C of any kind in this repository. LMDB turns out to be an
